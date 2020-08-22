@@ -16,7 +16,7 @@
 %%%-------------------------------------------------------------------
 {application, conf,
  [{description,  "YAML configuration for Erlang applications"},
-  {vsn,          "0.1.0"},
+  {vsn,          "0.1.1"},
   {modules,      []},
   {registered,   []},
   {applications, [kernel, stdlib, fast_yaml, yval]},
