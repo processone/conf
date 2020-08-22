@@ -1,12 +1,12 @@
 {"1.2.0",
 [{<<"fast_yaml">>,
   {git,"https://github.com/processone/fast_yaml.git",
-       {ref,"efeabe80f02b627ea2da1721704ab7cfd7dc2b1e"}},
+       {ref,"5c8e4a0511117617a3b9ff36c3385cbce40f3fb4"}},
   0},
  {<<"p1_utils">>,{pkg,<<"p1_utils">>,<<"1.0.17">>},1},
  {<<"yval">>,
   {git,"https://github.com/processone/yval.git",
-       {ref,"dd61371eddba9b077ab8354d3cd9a40ae3edcbee"}},
+       {ref,"a378f11e5ea53f2d6cf399a80cabd97960b99c97"}},
   0}]}.
 [
 {pkg_hash,[
