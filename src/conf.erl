@@ -32,9 +32,10 @@
 -export([start/2, stop/1, config_change/3]).
 -export_type([error_reason/0, apps_config/0]).
 
--type error_reason() :: {undefined_env, atom()} |
-                        {invalid_env, atom(), term()} |
-                        conf_yaml_backend:error_reason().
+-type backend() :: conf_yaml_backend.
+-type error_reason() :: {bad_env, conf_env:error_reason()} |
+                        {bad_ref, conf_file:ref(), conf_file:error_reason()} |
+                        {backend(), term()}.
 -type apps_config() :: [{atom(), #{atom() => term()} | {atom(), term()}}].
 -callback validator() -> yval:validator().
 
@@ -43,22 +44,26 @@
 %%%===================================================================
 -spec load_file(file:filename_all()) -> ok | {error, error_reason()}.
 load_file(Path0) ->
-    Path = expand_path(Path0),
-    read_and_load_file(Path, false).
+    case prep_path(Path0) of
+        {ok, Path} -> read_and_load_file(Path, false);
+        error -> erlang:error(badarg, [Path0])
+    end.
 
 -spec reload_file() -> ok | {error, error_reason()}.
 reload_file() ->
-    case get_env_file() of
+    case conf_env:file() of
         {ok, Path} ->
             reload_file(Path);
-        {error, _} = Err ->
-            Err
+        {error, Reason} ->
+            {error, {bad_env, Reason}}
     end.
 
 -spec reload_file(file:filename_all()) -> ok | {error, error_reason()}.
 reload_file(Path0) ->
-    Path = expand_path(Path0),
-    read_and_load_file(Path, true).
+    case prep_path(Path0) of
+        {ok, Path} -> read_and_load_file(Path, true);
+        error -> erlang:error(badarg, [Path0])
+    end.
 
 -spec load(term()) -> ok | {error, error_reason()}.
 load(Y) ->
@@ -68,25 +73,20 @@ load(Y) ->
 reload(Y) ->
     load(Y, true).
 
--spec get_path() -> {ok, file:filename_all()} | {error, error_reason()}.
+-spec get_path() -> {ok, binary()} | {error, error_reason()}.
 get_path() ->
-    case get_env_file() of
-        {ok, Path} ->
-            {ok, expand_path(Path)};
-        {error, _} = Err ->
-            Err
+    case conf_env:file() of
+        {ok, _} = OK -> OK;
+        {error, Reason} -> {error, {bad_env, Reason}}
     end.
 
 -spec format_error(error_reason()) -> string().
-format_error({undefined_env, Env}) ->
-    "Erlang environment variable '" ++ atom_to_list(Env) ++ "' is not set";
-format_error({invalid_env, Env, Val}) ->
-    lists:flatten(
-      io_lib:format(
-        "Invalid value of Erlang environment variable '~s': ~p",
-        [Env, Val]));
-format_error(Reason) ->
-    conf_yaml_backend:format_error(Reason).
+format_error({bad_env, Reason}) ->
+    conf_env:format_error(Reason);
+format_error({bad_ref, _Ref, Reason}) ->
+    conf_file:format_error(Reason);
+format_error({Module, Reason}) ->
+    Module:format_error(Reason).
 
 -spec start() -> ok | {error, term()}.
 start() ->
@@ -105,9 +105,8 @@ stop() ->
 -spec start(normal | {takeover, node()} | {failover, node()}, term()) ->
           {ok, pid()} | {error, term()}.
 start(_StartType, _StartArgs) ->
-    case get_env_file() of
-        {ok, Path0} ->
-            Path = expand_path(Path0),
+    case conf_env:file() of
+        {ok, Path} ->
             case read_and_load_file(Path, false) of
                 ok ->
                     conf_sup:start_link();
@@ -120,7 +119,7 @@ start(_StartType, _StartArgs) ->
         {error, {undefined_env, _}} ->
             conf_sup:start_link();
         {error, Reason} = Err ->
-            logger:critical("~s", [format_error(Reason)]),
+            logger:critical("~s", [conf_env:format_error(Reason)]),
             do_stop(Err)
     end.
 
@@ -137,65 +136,37 @@ config_change(_Changed, _New, _Removed) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
--spec read_and_load_file(file:filename_all(), boolean()) -> ok | {error, error_reason()}.
+-spec read_and_load_file(binary(), boolean()) -> ok | {error, error_reason()}.
 read_and_load_file(Path, Reload) ->
-    case conf_yaml_backend:read_file(Path) of
-        {ok, Y} ->
-            load(Y, Reload);
-        {error, _} = Err ->
-            Err
+    case conf_file:path_to_ref(Path) of
+        {error, Reason} -> {error, {bad_ref, Path, Reason}};
+        {ok, Ref} ->
+            Mimes = conf_yaml_backend:mime_types(),
+            case conf_file:read(Ref, Mimes) of
+                {error, Reason} ->
+                    {error, {bad_ref, Ref, Reason}};
+                {ok, Data} ->
+                    case conf_yaml_backend:decode(Data) of
+                        {ok, Y} ->
+                            load(Y, Reload);
+                        {error, Reason} ->
+                            {error, {conf_yaml_backend, Reason}}
+                    end
+            end
     end.
 
 -spec load(term(), boolean()) -> ok | {error, error_reason()}.
 load(Y, Reload) ->
     case conf_yaml_backend:validate(Y) of
         {ok, Config} ->
-            load_config(Config, Reload);
-        {error, _} = Err ->
-            Err
-    end.
-
--spec load_config(apps_config(), boolean()) -> ok.
-load_config(Config, Reload) ->
-    case Reload of
-        false ->
-            set_env(Config);
-        true ->
-            OldConfig = application_controller:prep_config_change(),
-            set_env(Config),
-            case application_controller:config_change(OldConfig) of
-                ok ->
-                    ok;
+            case conf_env:load(Config, Reload) of
+                ok -> ok;
                 {error, Errors} ->
                     report_config_change_errors(Errors)
-            end
+            end;
+        {error, Reason} ->
+            {error, {conf_yaml_backend, Reason}}
     end.
-
--spec set_env(apps_config()) -> ok.
--ifdef(old_set_env). % Erlang/OTP < 21.3.
-set_env(Config) ->
-    lists:foreach(
-      fun({App, Opts}) when is_map(Opts) ->
-              maps:fold(
-                fun(Par, Val, ok) ->
-                        application:set_env(App, Par, Val, [{persistent, true}])
-                end, ok, Opts);
-         ({App, Opts}) when is_list(Opts) ->
-              lists:foreach(
-                fun({Par, Val}) ->
-                        application:set_env(App, Par, Val, [{persistent, true}])
-                end, Opts)
-      end, Config).
--else.
-set_env(Config) ->
-    NewConfig = lists:map(
-                  fun({App, Opts}) when is_map(Opts) ->
-                          {App, maps:to_list(Opts)};
-                     ({App, Opts}) when is_list(Opts) ->
-                          {App, Opts}
-                  end, Config),
-    application:set_env(NewConfig, [{persistent, true}]).
--endif.
 
 -spec report_config_change_errors(term()) -> ok.
 report_config_change_errors(Errors) when is_list(Errors) ->
@@ -215,20 +186,9 @@ report_config_change_errors(Error) ->
       "Failed to change configuration of Erlang applications: ~p",
       [Error]).
 
--spec get_env_file() -> {ok, binary()} | {error, error_reason()}.
-get_env_file() ->
-    case application:get_env(conf, file) of
-        {ok, Path0} ->
-            try {ok, unicode:characters_to_binary(Path0)}
-            catch _:_ -> {error, {invalid_env, file, Path0}}
-            end;
-        undefined ->
-            {error, {undefined_env, file}}
-    end.
-
 -spec do_stop({error, term()}) -> {error, term()}.
 do_stop({error, Reason} = Err) ->
-    case application:get_env(conf, on_fail, stop) of
+    case conf_env:on_fail() of
         stop ->
             Err;
         OnFail ->
@@ -244,25 +204,21 @@ do_stop({error, Reason} = Err) ->
 flush_logger() ->
     lists:foreach(
       fun(#{id := Name, module := Mod}) ->
-              case erlang:function_exported(Mod, filesync, 1) of
-                  true -> Mod:filesync(Name);
-                  false -> ok
+              case conf_misc:try_load(Mod, filesync, 1) of
+                  {ok, _} -> Mod:filesync(Name);
+                  _ -> ok
               end
       end, logger:get_handler_config()).
 
--spec expand_path(file:filename_all()) -> file:filename_all().
-expand_path(Path) ->
-    filename:absname(
-      filename:join(
-        lists:map(fun expand_env/1, filename:split(Path)))).
-
--spec expand_env(unicode:chardata()) -> unicode:chardata().
-expand_env(<<$$, _/binary>> = Env) ->
-    expand_env(binary_to_list(Env));
-expand_env([$$|Env]) ->
-    case os:getenv(Env) of
-        false -> "";
-        Value -> Value
+-spec prep_path(file:filename_all()) -> {ok, binary()} | error.
+prep_path(Path) when is_binary(Path), Path /= <<>> ->
+    {ok, Path};
+prep_path(Path) when is_list(Path), Path /= [] ->
+    try unicode:characters_to_binary(Path) of
+        Bin when is_binary(Bin) -> {ok, Bin};
+        _ -> error
+    catch _:_ ->
+            error
     end;
-expand_env(Other) ->
-    Other.
+prep_path(_) ->
+    error.

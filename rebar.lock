@@ -6,7 +6,7 @@
  {<<"p1_utils">>,{pkg,<<"p1_utils">>,<<"1.0.17">>},1},
  {<<"yval">>,
   {git,"https://github.com/processone/yval.git",
-       {ref,"a378f11e5ea53f2d6cf399a80cabd97960b99c97"}},
+       {ref,"432902afcb48a4d6b568893a9831dd504626b133"}},
   0}]}.
 [
 {pkg_hash,[

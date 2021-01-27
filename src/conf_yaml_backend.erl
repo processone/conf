@@ -15,24 +15,32 @@
 %%%
 %%%-------------------------------------------------------------------
 -module(conf_yaml_backend).
+-behaviour(conf_backend).
 
 %% API
--export([read_file/1]).
+-export([decode/1]).
 -export([validate/1]).
+-export([mime_types/0]).
 -export([format_error/1]).
 -export_type([error_reason/0]).
 
+-type yaml() :: term(). %% TODO: must be fast_yaml:yaml(), but it's not exported
+-type yaml_error_reason() :: {bad_yaml, term()}.
 -type error_reason() :: {unsupported_application, atom()} |
                         {invalid_yaml_config, yval:error_reason(), yval:ctx()} |
-                        {bad_yaml, term()}.
+                        {bad_ref, binary(), yaml_error_reason() | conf_file:error_reason()} |
+                        {bad_env, conf:error_reason()} |
+                        {bad_mod, conf_misc:error_reason()} |
+                        {circular_ref, binary()} |
+                        yaml_error_reason().
 -type distance_cache() :: #{{string(), string()} => non_neg_integer()}.
 
 %%%===================================================================
-%%% API
+%%% conf_backend callbacks
 %%%===================================================================
--spec read_file(file:filename_all()) -> {ok, term()} | {error, {bad_yaml, term()}}.
-read_file(Path) ->
-    case fast_yaml:decode_from_file(Path) of
+-spec decode(iodata()) -> {ok, yaml()} | {error, error_reason()}.
+decode(Data) ->
+    case fast_yaml:decode(Data) of
         {ok, [Y]} ->
             {ok, Y};
         {ok, []} ->
@@ -41,27 +49,40 @@ read_file(Path) ->
             {error, {bad_yaml, Reason}}
     end.
 
--spec validate(term()) -> {ok, conf:apps_config()} | {error, error_reason()}.
-validate(Y) ->
-    case yval:validate(top_validator(), Y) of
-        {ok, AppOpts} ->
-            case create_validators(AppOpts) of
-                {ok, Validators} ->
-                    Validator = yval:options(Validators),
-                    case yval:validate(Validator, AppOpts) of
-                        {ok, Config} ->
-                            {ok, Config};
-                        {error, Reason, Ctx} ->
-                            {error, {invalid_yaml_config, Reason, Ctx}}
+-spec validate(yaml()) -> {ok, conf:apps_config()} | {error, error_reason()}.
+validate(Y0) ->
+    try yval:validate(refs_validator(), Y0) of
+        {ok, Y} ->
+            case yval:validate(top_validator(), Y) of
+                {ok, AppOpts} ->
+                    case create_validators(AppOpts) of
+                        {ok, Validators} ->
+                            Validator = yval:options(Validators),
+                            case yval:validate(Validator, AppOpts) of
+                                {ok, Config} ->
+                                    {ok, Config};
+                                {error, Reason, Ctx} ->
+                                    {error, {invalid_yaml_config, Reason, Ctx}}
+                            end;
+                        {error, _} = Err ->
+                            Err
                     end;
-                {error, _} = Err ->
-                    Err
+                {error, Reason, Ctx} ->
+                    {error, {invalid_yaml_config, Reason, Ctx}}
             end;
         {error, Reason, Ctx} ->
             {error, {invalid_yaml_config, Reason, Ctx}}
+    catch _:{?MODULE, Reason, _Ctx} ->
+            {error, Reason}
     end.
 
--spec format_error(error_reason()) -> string().
+-spec mime_types() -> [binary(), ...].
+mime_types() ->
+    [<<"application/json">>, <<"application/yaml">>,
+     <<"application/x-yaml">>, <<"application/octet-stream">>,
+     <<"text/x-yaml">>, <<"text/plain">>].
+
+-spec format_error(error_reason()) -> unicode:chardata().
 format_error({unsupported_application, App}) ->
     "Erlang application '" ++ atom_to_list(App) ++ "' doesn't support YAML configuration";
 format_error({invalid_yaml_config, {bad_enum, Known, Bad}, Ctx}) ->
@@ -79,8 +100,22 @@ format_error({invalid_yaml_config, {unknown_option, Known, Opt}, Ctx}) ->
                 format_known("Available parameters", Known)]);
 format_error({invalid_yaml_config, Reason, Ctx}) ->
     yval:format_error(Reason, Ctx);
+format_error({depth_limit, Limit}) ->
+    format("Depth limit reached: ~B", [Limit]);
+format_error({bad_ref, Ref, Reason}) ->
+    format("Failed to read from ~ts: ~s",
+           [Ref, case Reason of
+                     {bad_yaml, _} -> format_error(Reason);
+                     _ -> conf_file:format_error(Reason)
+                 end]);
+format_error({circular_ref, Ref}) ->
+    format("Circularly defined reference: ~ts", [Ref]);
 format_error({bad_yaml, Reason}) ->
-    fast_yaml:format_error(Reason).
+    "Malformed YAML: " ++ fast_yaml:format_error(Reason);
+format_error({bad_env, Reason}) ->
+    conf_env:format_error(Reason);
+format_error({bad_mod, Reason}) ->
+    conf_misc:format_error(Reason).
 
 %%%===================================================================
 %%% Internal functions
@@ -90,18 +125,12 @@ format_error({bad_yaml, Reason}) ->
 create_validators(AppOpts) ->
     lists:foldl(
       fun({App, _Opts}, {ok, Acc}) ->
-              Mod = callback_module(App),
-              case code:ensure_loaded(Mod) of
-                  {module, Mod} ->
-                      case erlang:function_exported(Mod, validator, 0) of
-                          true ->
-                              Validator = Mod:validator(),
-                              {ok, Acc#{App => Validator}};
-                          false ->
-                              {error, {unsupported_application, App}}
-                      end;
-                  _ ->
-                      {error, {unsupported_application, App}}
+              case callback_module(App) of
+                  {ok, Mod} ->
+                      Validator = Mod:validator(),
+                      {ok, Acc#{App => Validator}};
+                  {error, _} = Err ->
+                      Err
               end;
          (_, {error, _} = Err) ->
               Err
@@ -110,9 +139,76 @@ create_validators(AppOpts) ->
 top_validator() ->
     yval:map(yval:atom(), yval:any(), [unique]).
 
--spec callback_module(atom()) -> module().
+-spec callback_module(atom()) -> {ok, module()} | {error, error_reason()}.
 callback_module(App) ->
-    list_to_atom(atom_to_list(App) ++ "_yaml").
+    case conf_env:callback_module(App) of
+        {ok, Mod} ->
+            case conf_misc:try_load(Mod, validator, 0) of
+                {ok, _} = OK ->
+                    OK;
+                {error, Reason} ->
+                    {error, {bad_mod, Reason}}
+            end;
+        {error, {undefined_env, _}} ->
+            Mod = list_to_atom(atom_to_list(App) ++ "_yaml"),
+            case conf_misc:try_load(Mod, validator, 0) of
+                {ok, _} = OK ->
+                    OK;
+                {error, _} ->
+                    {error, {unsupported_application, App}}
+            end;
+        {error, Reason} ->
+            {error, {bad_env, Reason}}
+    end.
+
+-spec refs_validator() -> yval:validator().
+refs_validator() ->
+    refs_validator(0, []).
+
+%% FIXME: currently this validator doesn't track context so
+%% in the case of a failure it's clueless where it has occured.
+-spec refs_validator(non_neg_integer(), [binary()]) -> yval:validator().
+refs_validator(Limit = 100, _) ->
+    yval:fail(?MODULE, {depth_limit, Limit});
+refs_validator(Level, Paths) ->
+    fun([{_, _}|_] = Y) ->
+            lists:flatmap(
+              fun({Key, Val}) when Key == <<"$ref">> orelse Key == '$ref' ->
+                      Path = (yval:non_empty(yval:binary()))(Val),
+                      case conf_file:path_to_ref(Path) of
+                          {ok, Ref} ->
+                              Path0 = conf_file:format_ref(Ref),
+                              case lists:member(Path0, Paths) of
+                                  true ->
+                                      yval:fail(?MODULE, {circular_ref, Path0});
+                                  false ->
+                                      case read_ref(Ref) of
+                                          {ok, IncludeY} ->
+                                              (refs_validator(Level+1, [Path0|Paths]))(IncludeY);
+                                          {error, Reason} ->
+                                              yval:fail(?MODULE, {bad_ref, Path0, Reason})
+                                      end
+                              end;
+                          {error, Reason} ->
+                              yval:fail(?MODULE, {bad_ref, Path, Reason})
+                      end;
+                 ({Key, Val}) ->
+                      [{Key, (refs_validator(Level+1, Paths))(Val)}]
+              end, Y);
+       (Y) when is_list(Y) ->
+            (yval:list(refs_validator(Level+1, Paths)))(Y);
+       (Y) ->
+            Y
+    end.
+
+-spec read_ref(conf_file:ref()) -> {ok, yaml()} |
+                                   {error, yaml_error_reason()} |
+                                   {error, conf_file:error_reason()}.
+read_ref(Ref) ->
+    case conf_file:read(Ref, mime_types()) of
+        {ok, Data} -> decode(Data);
+        {error, _} = Err -> Err
+    end.
 
 %%%===================================================================
 %%% Formatters
